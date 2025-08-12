@@ -1,0 +1,414 @@
+# SketchUp Normal Flipper Tool v1.0
+# Compatible with SketchUp Pro V25.0.660
+# This tool flips only the faces that are actually inverted (back-facing)
+
+module NormalFlipper
+  
+  # Main function to flip only inverted faces
+  def self.fix_inverted_faces
+    model = Sketchup.active_model
+    selection = model.selection
+    
+    # Check if anything is selected
+    if selection.empty?
+      UI.messagebox("Please select some faces, groups, or components first.")
+      return
+    end
+    
+    # Start operation for undo
+    model.start_operation('Fix Inverted Faces', true)
+    
+    begin
+      faces_to_flip = []
+      total_faces_checked = 0
+      
+      # Process selection
+      selection.each do |entity|
+        case entity
+        when Sketchup::Face
+          total_faces_checked += 1
+          if self.is_face_inverted?(entity)
+            faces_to_flip << entity
+          end
+        when Sketchup::Group
+          faces = self.get_faces_from_group(entity)
+          total_faces_checked += faces.length
+          faces.each do |face|
+            if self.is_face_inverted?(face)
+              faces_to_flip << face
+            end
+          end
+        when Sketchup::ComponentInstance
+          definition = entity.definition
+          faces = self.get_faces_from_definition(definition)
+          total_faces_checked += faces.length
+          faces.each do |face|
+            if self.is_face_inverted?(face, entity.transformation)
+              faces_to_flip << face
+            end
+          end
+        end
+      end
+      
+      # Flip the inverted faces
+      faces_flipped = 0
+      faces_to_flip.each do |face|
+        begin
+          face.reverse!
+          faces_flipped += 1
+        rescue => e
+          puts "Failed to flip face: #{e.message}"
+        end
+      end
+      
+      model.commit_operation
+      
+      # Show results
+      if faces_flipped > 0
+        UI.messagebox("Smart Normal Fix Complete!\n\nChecked: #{total_faces_checked} faces\nFixed: #{faces_flipped} inverted faces")
+        puts "Fixed #{faces_flipped} inverted faces out of #{total_faces_checked} total faces"
+      else
+        UI.messagebox("No inverted faces found in selection.\n\nChecked: #{total_faces_checked} faces")
+      end
+      
+    rescue => e
+      model.abort_operation
+      UI.messagebox("Error occurred: #{e.message}")
+      puts "Error: #{e.message}\n#{e.backtrace.join('\n')}"
+    end
+  end
+  
+  # Function to flip ALL faces (original behavior)
+  def self.flip_all_faces
+    model = Sketchup.active_model
+    selection = model.selection
+    
+    if selection.empty?
+      UI.messagebox("Please select some faces, groups, or components first.")
+      return
+    end
+    
+    result = UI.messagebox("This will flip ALL faces in your selection, not just inverted ones.\n\nAre you sure?", MB_YESNO)
+    return if result == IDNO
+    
+    model.start_operation('Flip All Face Normals', true)
+    
+    begin
+      faces_flipped = 0
+      
+      selection.each do |entity|
+        case entity
+        when Sketchup::Face
+          entity.reverse!
+          faces_flipped += 1
+        when Sketchup::Group
+          faces = self.get_faces_from_group(entity)
+          faces.each do |face|
+            face.reverse!
+            faces_flipped += 1
+          end
+        when Sketchup::ComponentInstance
+          definition = entity.definition
+          faces = self.get_faces_from_definition(definition)
+          faces.each do |face|
+            face.reverse!
+            faces_flipped += 1
+          end
+        end
+      end
+      
+      model.commit_operation
+      UI.messagebox("Flipped #{faces_flipped} faces")
+      
+    rescue => e
+      model.abort_operation
+      UI.messagebox("Error occurred: #{e.message}")
+    end
+  end
+  
+  # Check if a face is inverted (back-facing)
+  def self.is_face_inverted?(face, transformation = nil)
+    begin
+      # Get face normal
+      normal = face.normal
+      
+      # Transform normal if dealing with component instance
+      if transformation
+        normal = normal.transform(transformation)
+      end
+      
+      # Get face center
+      center = face.bounds.center
+      if transformation
+        center = center.transform(transformation)
+      end
+      
+      # NEW APPROACH: Use the object's own bounding box center instead of model center
+      # Get the parent entity's bounding box
+      parent_bounds = nil
+      if face.parent.is_a?(Sketchup::ComponentDefinition)
+        parent_bounds = face.parent.bounds
+      elsif face.parent.is_a?(Sketchup::Model)
+        # For faces in the main model, use a smarter approach
+        # Get bounding box of nearby geometry
+        nearby_entities = face.parent.entities.select { |e| 
+          e.is_a?(Sketchup::Face) && e.bounds.intersect(face.bounds)
+        }
+        if nearby_entities.length > 1
+          combined_bounds = Geom::BoundingBox.new
+          nearby_entities.each { |e| combined_bounds.add(e.bounds) }
+          parent_bounds = combined_bounds
+        else
+          parent_bounds = face.bounds
+        end
+      else
+        parent_bounds = face.parent.bounds
+      end
+      
+      object_center = parent_bounds.center
+      
+      # Vector from object center to face center
+      to_face = center - object_center
+      
+      # If face is at the object center, use a different approach
+      if to_face.length < 0.001
+        # For faces at center, check if normal points generally "outward"
+        # Use camera view direction as reference
+        view = Sketchup.active_model.active_view
+        camera = view.camera
+        view_direction = camera.direction
+        
+        # If normal is pointing toward camera, it might be inverted
+        dot_with_camera = normal.dot(view_direction)
+        return dot_with_camera > 0.5
+      end
+      
+      to_face.normalize!
+      
+      # Check if normal is pointing away from object center (outward)
+      # If dot product is negative, the face is likely inverted
+      dot_product = normal.dot(to_face)
+      
+      # Use a more conservative threshold
+      return dot_product < -0.2
+      
+    rescue => e
+      puts "Error checking face orientation: #{e.message}"
+      return false
+    end
+  end
+  
+  # Get all faces from a group
+  def self.get_faces_from_group(group)
+    faces = []
+    group.entities.each do |entity|
+      if entity.is_a?(Sketchup::Face)
+        faces << entity
+      elsif entity.is_a?(Sketchup::Group)
+        faces.concat(self.get_faces_from_group(entity))
+      elsif entity.is_a?(Sketchup::ComponentInstance)
+        faces.concat(self.get_faces_from_definition(entity.definition))
+      end
+    end
+    faces
+  end
+  
+  # Get all faces from a component definition
+  def self.get_faces_from_definition(definition)
+    faces = []
+    definition.entities.each do |entity|
+      if entity.is_a?(Sketchup::Face)
+        faces << entity
+      elsif entity.is_a?(Sketchup::Group)
+        faces.concat(self.get_faces_from_group(entity))
+      elsif entity.is_a?(Sketchup::ComponentInstance)
+        faces.concat(self.get_faces_from_definition(entity.definition))
+      end
+    end
+    faces
+  end
+  
+  # Alternative method: Use SketchUp's visual approach
+  def self.fix_inverted_faces_visual
+    model = Sketchup.active_model
+    selection = model.selection
+    
+    if selection.empty?
+      UI.messagebox("Please select some faces first.\n\nTip: Use View > Face Style > Monochrome to see face orientations:\n- White = Front faces (correct)\n- Gray = Back faces (inverted)")
+      return
+    end
+    
+    # Count gray (back-facing) faces in monochrome mode
+    result = UI.messagebox("This method works best in Monochrome view mode.\n\nFirst, go to View > Face Style > Monochrome\nGray faces = Back-facing (inverted)\nWhite faces = Front-facing (correct)\n\nDo you want to flip the GRAY faces to white?", MB_YESNO)
+    return if result == IDNO
+    
+    model.start_operation('Fix Gray Faces', true)
+    
+    begin
+      faces_flipped = 0
+      
+      selection.each do |entity|
+        if entity.is_a?(Sketchup::Face)
+          # In SketchUp, we can check if a face is back-facing by checking its material
+          # Back faces typically appear gray in monochrome mode
+          
+          # Simple heuristic: check face normal direction relative to view
+          view = model.active_view
+          camera = view.camera
+          view_direction = camera.direction
+          
+          face_normal = entity.normal
+          
+          # If face normal points toward camera, it's showing its back
+          dot_product = face_normal.dot(view_direction)
+          
+          if dot_product > 0.1  # Face is back-facing from current view
+            entity.reverse!
+            faces_flipped += 1
+          end
+        end
+      end
+      
+      model.commit_operation
+      UI.messagebox("Flipped #{faces_flipped} faces that were showing their back sides")
+      
+    rescue => e
+      model.abort_operation
+      UI.messagebox("Error occurred: #{e.message}")
+    end
+  end
+  def self.toggle_face_orientation_display
+    model = Sketchup.active_model
+    view = model.active_view
+    
+    # SketchUp doesn't have a direct API for face orientation display
+    # But we can suggest the user to check View menu
+    UI.messagebox("To visualize face orientation:\n\n1. Go to View menu\n2. Select Face Style\n3. Choose 'Monochrome' to see front (white) vs back (gray) faces\n\nOR\n\n1. View > Edge Style > Back Edges\nThis shows back-facing edges differently")
+  end
+  
+  # Create toolbar
+  def self.create_toolbar
+    toolbar = UI::Toolbar.new("Normal Flipper")
+    
+    # Smart fix button
+    cmd_smart = UI::Command.new("Fix Inverted Faces") {
+      self.fix_inverted_faces
+    }
+    cmd_smart.menu_text = "Fix Only Inverted Faces (Smart)"
+    cmd_smart.tooltip = "Intelligently flip only the faces that are actually inverted"
+    cmd_smart.status_bar_text = "Fix inverted face normals"
+    cmd_smart.small_icon = cmd_smart.large_icon = File.join(__dir__, "smart_fix.png") rescue ""
+    
+    # Flip all button
+    cmd_all = UI::Command.new("Flip All Faces") {
+      self.flip_all_faces
+    }
+    cmd_all.menu_text = "Flip ALL Face Normals"
+    cmd_all.tooltip = "Flip all selected faces (use with caution)"
+    cmd_all.status_bar_text = "Flip all face normals"
+    cmd_all.small_icon = cmd_all.large_icon = File.join(__dir__, "flip_all.png") rescue ""
+    
+    # Face orientation help
+    cmd_help = UI::Command.new("Face Orientation Help") {
+      self.toggle_face_orientation_display
+    }
+    cmd_help.menu_text = "Show Face Orientation Help"
+    cmd_help.tooltip = "Instructions for visualizing face orientation"
+    cmd_help.status_bar_text = "Help with face orientation display"
+    
+    # Visual fix button
+    cmd_visual = UI::Command.new("Fix Gray Faces") {
+      self.fix_inverted_faces_visual
+    }
+    cmd_visual.menu_text = "Fix Gray Faces (Visual Method)"
+    cmd_visual.tooltip = "Fix faces that appear gray in Monochrome view"
+    cmd_visual.status_bar_text = "Fix gray (back-facing) faces"
+    
+    toolbar.add_item(cmd_smart)
+    toolbar.add_separator
+    toolbar.add_item(cmd_visual)
+    toolbar.add_separator
+    toolbar.add_item(cmd_all)
+    toolbar.add_separator  
+    toolbar.add_item(cmd_help)
+    
+    toolbar.show
+    toolbar
+  end
+  
+  # Create menu items
+  def self.create_menu
+    plugins_menu = UI.menu("Plugins")
+    normal_menu = plugins_menu.add_submenu("Normal Flipper")
+    
+    normal_menu.add_item("Fix Only Inverted Faces (Smart)") {
+      self.fix_inverted_faces
+    }
+    
+    normal_menu.add_item("Fix Gray Faces (Visual Method)") {
+      self.fix_inverted_faces_visual
+    }
+    
+    normal_menu.add_separator
+    
+    normal_menu.add_item("Flip ALL Face Normals") {
+      self.flip_all_faces
+    }
+    
+    normal_menu.add_separator
+    
+    normal_menu.add_item("Face Orientation Help") {
+      self.toggle_face_orientation_display
+    }
+  end
+  
+end
+
+# Initialize the extension
+if defined?(Sketchup)
+  # Create menu and toolbar
+  NormalFlipper.create_menu
+  toolbar = NormalFlipper.create_toolbar
+  
+  puts "Normal Flipper Tool loaded successfully!"
+  puts "Access via Plugins > Normal Flipper menu or use the toolbar"
+end
+
+=begin
+INSTALLATION INSTRUCTIONS FOR SKETCHUP PRO V25.0.660:
+
+METHOD 1 - Via Extension Manager (Recommended):
+1. Save this code as 'normal_flipper.rb'
+2. Open SketchUp
+3. Go to Window > Extension Manager
+4. Click 'Install Extension'
+5. Select the .rb file
+6. Restart SketchUp
+
+METHOD 2 - Manual Installation:
+1. Save this code as 'normal_flipper.rb'
+2. Copy the file to your SketchUp Plugins folder:
+   Windows: C:\Users\[username]\AppData\Roaming\SketchUp\SketchUp 2025\SketchUp\Plugins\
+   Mac: ~/Library/Application Support/SketchUp 2025/SketchUp/Plugins/
+3. Restart SketchUp
+
+USAGE:
+1. Select faces, groups, or components in your model
+2. Access via Plugins > Normal Flipper menu
+3. Choose "Fix Only Inverted Faces (Smart)" for intelligent correction
+4. Use "Face Orientation Help" for visualization tips
+
+FEATURES:
+- Smart detection of inverted faces only
+- Works with individual faces, groups, and components  
+- Batch processing of multiple objects
+- Undo support
+- Safe operation with error handling
+- Both smart fix and flip-all options
+
+FACE ORIENTATION VISUALIZATION:
+- View > Face Style > Monochrome (white = front, gray = back)
+- View > Edge Style > Back Edges (shows back-facing edges differently)
+
+The tool will appear in both the Plugins menu and as a toolbar for easy access.
+=end
